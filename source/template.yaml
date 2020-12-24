@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: '2010-09-09' 
+Transform: AWS::Serverless-2016-10-31 
+Description: >
+  (SO0115) - Solution - Master Template
+
+  Solution to receive new ADX revisions and initate downstream processing. 
+ 
+Globals: 
+  Function: 
+    Timeout: 300 
+
+Parameters:
+  SubscriptionBucket :
+    Type: String
+    Description: S3 Bucket name where assets will be imported from ADX
+  SubscriptionPrefix:
+    Type: String
+    Description: S3 prefix location for imported assets from ADX
+  LoggingLevel: 
+    Type: String
+    Description: Minimum logging level to write out to CloudWatch
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+      - CRITICAL
+    Default: INFO
+  DataSetId:
+    Type: String
+    Description: The AWS Marketplace dataset to trigger off for new Assets. 
+  DownstreamProcessingLambda:
+    Type: String
+    Description: Arn of existing Lambda to execute once all the assets have been imported into S3. (arn:aws:lambda:<region>:<account>:function:<function name>)
+Mappings:
+  Send:
+    AnonymousUsage:
+      Data: "Yes"
+  SolutionInformation:
+    SoltuionDetails:
+      Version : "1.0.0"
+      Identifier : "SO0115"
+  SourceCode:
+    General:
+      S3Bucket: "%%BUCKET_NAME%%"
+      KeyPrefix: "%%SOLUTION_NAME%%/%%VERSION%%"
+Resources:
+  SolutionHelper:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: SolutionHelper/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Environment:
+        Variables:
+          LOG_LEVEL : !Ref LoggingLevel
+          AnonymousUsage : !FindInMap ["Send", "AnonymousUsage", "Data"]
+  SolutionUuid:
+    Type: "Custom::LoadLambda"
+    Properties:
+      ServiceToken: !GetAtt ["SolutionHelper", "Arn"]
+      CustomAction: "CreateUuid"
+  SolutionLifecycle:
+    Type: "Custom::LoadLambda"
+    Properties:
+      ServiceToken: !GetAtt ["SolutionHelper", "Arn"]
+      SolutionId: !FindInMap ["SolutionInformation", "SoltuionDetails", "Identifier"]
+      UUID: !GetAtt SolutionUuid.UUID
+      CustomAction: "LifecycleMetric"
+      Version: !FindInMap ["SolutionInformation", "SoltuionDetails", "Version"]
+  SubscriptionEventRule: 
+    Type: AWS::Events::Rule 
+    Properties: 
+      Description: Rule to fire when a revision is published for a subscription.   
+      EventPattern:  
+        source: 
+          - "aws.dataexchange" 
+        detail-type: 
+          - "Revision Published To Data Set" 
+        resources: 
+          - !Ref DataSetId
+      State: "ENABLED" 
+      Targets: 
+        -
+          Arn: !Ref SubscribeAndCallDownstreamStepFunction
+          Id: DataExchangeRevisionPublished
+          RoleArn: !GetAtt [ CWEExecutionRole, Arn ] 
+  CheckJobStatusFunction: 
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction 
+    Properties: 
+      CodeUri: CheckJobStatusFunction/ 
+      Handler: app.lambda_handler 
+      Runtime: python3.8 
+      Role: !GetAtt CheckJobStatusFunctionRole.Arn
+      Environment:
+        Variables:
+          LOG_LEVEL : !Ref LoggingLevel
+  CheckJobStatusFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement : 
+          - Effect : Allow
+            Principal: 
+              Service:
+                - lambda.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: ADXGetJobStatus
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action : 
+                  - dataexchange:GetJob
+                Resource : '*'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: "W11"
+            reason: "Jobs created at runtime so ARNs will not be known a priori."
+  SubscribeRevisionFunction: 
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction 
+    Properties: 
+      CodeUri: SubscribeRevisionFunction/ 
+      Handler: app.lambda_handler 
+      Runtime: python3.8 
+      Environment: 
+        Variables: 
+          BUCKET : !Ref SubscriptionBucket 
+          PREFIX_START : !Ref SubscriptionPrefix
+          AnonymousUsage : !FindInMap ["Send", "AnonymousUsage", "Data"]
+          SolutionId: !FindInMap ["SolutionInformation", "SoltuionDetails", "Identifier"]
+          UUID: !GetAtt SolutionUuid.UUID
+          Version: !FindInMap ["SolutionInformation", "SoltuionDetails", "Version"]  
+      Policies: 
+            - S3CrudPolicy: 
+                BucketName: 
+                  !Ref SubscriptionBucket 
+            - AWSDataExchangeSubscriberFullAccess 
+  SubscribeAndCallDownstreamStepFunction: 
+    Type: AWS::StepFunctions::StateMachine 
+    Properties: 
+      DefinitionString: 
+        !Sub 
+          - |
+            { 
+              "Comment": "Step function to coordinate the subscription of a new revision", 
+              "StartAt": "SubscribeRevision", 
+              "States": { 
+                "SubscribeRevision": { 
+                  "Type": "Task", 
+                  "Resource": "${SubscribeRevisionFunctionArn}", 
+                  "Next": "WaitProcessing" 
+                }, 
+                "ChoiceComplete" : { 
+                  "Type" : "Choice", 
+                  "Choices" : [ 
+                    { 
+                      "Variable" : "$.JobStatus", 
+                      "StringEquals" : "COMPLETED", 
+                      "Next" : "NotifyComplete" 
+                    }, 
+                    {  
+                      "Variable" : "$.JobStatus", 
+                      "StringEquals" : "IN_PROGRESS", 
+                      "Next" : "WaitProcessing" 
+                    }, 
+                    { 
+                      "Variable" : "$.JobStatus", 
+                      "StringEquals" : "ERROR", 
+                      "Next" : "Failed" 
+                    } 
+                   ] 
+                }, 
+                "NotifyComplete" : { 
+                  "Type" : "Task", 
+                  "Resource" : "${DownstreamProcessingLambdaArn}", 
+                  "End" : true 
+                }, 
+                "WaitProcessing" : { 
+                  "Type" : "Wait", 
+                  "Seconds" : 10, 
+                  "Next" : "CheckJobStatus" 
+                }, 
+                "CheckJobStatus" : { 
+                  "Type" : "Task", 
+                  "Resource" : "${CheckJobStatusArn}", 
+                  "Next" : "ChoiceComplete" 
+                }, 
+                "Failed" : { 
+                  "Type" : "Pass", 
+                  "End" : true 
+                } 
+              } 
+            } 
+          - {DownstreamProcessingLambdaArn: !Ref DownstreamProcessingLambda, SubscribeRevisionFunctionArn: !GetAtt [ SubscribeRevisionFunction, Arn ], CheckJobStatusArn: !GetAtt [ CheckJobStatusFunction, Arn ]} 
+      RoleArn: !GetAtt [ SFExecutionRole, Arn ] 
+  SFExecutionRole: 
+    Type: "AWS::IAM::Role" 
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17" 
+        Statement: 
+          - Effect: "Allow" 
+            Principal: 
+              Service: 
+                - !Sub states.${AWS::Region}.amazonaws.com 
+            Action: "sts:AssumeRole" 
+      Path: "/" 
+      Policies: 
+        - PolicyName: StatesExecutionPolicy 
+          PolicyDocument: 
+            Version: "2012-10-17" 
+            Statement: 
+              - Effect: Allow 
+                Action: 
+                  - "lambda:InvokeFunction" 
+                Resource: 
+                  - !Ref DownstreamProcessingLambda
+                  - !GetAtt [ SubscribeRevisionFunction, Arn ]
+                  - !GetAtt [ CheckJobStatusFunction, Arn ]
+  CWEExecutionRole: 
+    Type: "AWS::IAM::Role" 
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17" 
+        Statement: 
+          - Effect: "Allow" 
+            Principal: 
+              Service: 
+                - !Sub events.amazonaws.com 
+            Action: "sts:AssumeRole" 
+      Path: "/" 
+      Policies: 
+        - PolicyName: StatesExecutionPolicy 
+          PolicyDocument: 
+            Version: "2012-10-17" 
+            Statement: 
+              - Effect: Allow 
+                Action: 
+                  - "states:StartExecution" 
+                Resource: !Ref SubscribeAndCallDownstreamStepFunction
+ 
