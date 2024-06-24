@@ -46,29 +46,22 @@ def lambda_handler(event, context):
         prefix = prefix_start + '/' + datasetId + '/' + revisionId 
         dataexchange = boto3.client(service_name='dataexchange')
         assetlist = dataexchange.list_revision_assets(DataSetId=datasetId,RevisionId=revisionId)
-        assets = []
-        for asset in assetlist['Assets']:
-            assetId = asset['Id']
-            nameparts = asset['Name'].split('/')
-            filename = nameparts[len(nameparts)-1]
-            assets.append({
-                  "AssetId": assetId,
-                  "Bucket": bucket,
-                  "Key": prefix + '/' + filename
-                })
 
         revisiondetails = {
-            "ExportAssetsToS3": {
-                "AssetDestinations": 
-                    assets 
+            "ExportRevisionsToS3": {
+                "RevisionDestinations": 
+                [{
+                  "RevisionId": revisionId,
+                  "Bucket": bucket,
+                  "KeyPattern": "${Revision.CreatedAt.Year}/${Revision.CreatedAt.Month}/${Asset.Id}"
+                }] 
                 ,
                 "DataSetId": datasetId,
-                "RevisionId": revisionId
             }
         }
 
         logging.debug('revisiondetails={}'.format(revisiondetails))
-        jobresponse = dataexchange.create_job(Type='EXPORT_ASSETS_TO_S3', Details=revisiondetails)
+        jobresponse = dataexchange.create_job(Type='EXPORT_REVISIONS_TO_S3', Details=revisiondetails)
         jobArnparts = jobresponse['Arn'].split('/')
         jobId = jobArnparts[1]
         logging.info('jobId={}'.format(jobId))
